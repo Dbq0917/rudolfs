@@ -56,9 +56,17 @@ pass this to the server below via the `--key` option. If the `--key` option is
 **not** specified, then the LFS objects are **not** encrypted.
 
 **Note**:
- - If the key ever changes (or if encryption is disabled), all existing LFS
-   objects will become garbage. When the Git LFS client attempts to download
-   them, the SHA256 verification step will fail.
+ - Encrypted objects store a small plaintext metadata header containing the
+   key version and the SHA-256 fingerprint of the key. The fingerprint
+   identifies the key version but is not itself the key and cannot decrypt the
+   object.
+ - When rotating the monthly key, configure the new key as `--key` and the old
+   key as `--previous-key` (or set `RUDOLFS_PREVIOUS_KEY`) for the seven-day
+   overlap window. New objects use the new key, while the metadata header lets
+   reads of old objects select the old key. After the overlap window, remove
+   the previous key configuration.
+ - If an object's key is not configured (or if encryption is disabled), its
+   contents cannot be decoded and Git LFS verification will fail.
  - Likewise, if encryption is later enabled after it has been disabled, all
    existing unencrypted LFS objects will be seen as garbage.
  - LFS objects in both the cache and in permanent storage are encrypted.

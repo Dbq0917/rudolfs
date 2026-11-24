@@ -26,7 +26,8 @@ mod lfs;
 mod logger;
 mod lru;
 mod sha256;
-mod storage;
+pub mod storage;
+pub use storage::encrypt as encryption;
 mod util;
 
 use std::convert::Infallible;
@@ -45,6 +46,10 @@ use crate::app::App;
 use crate::error::Error;
 use crate::logger::Logger;
 use crate::storage::{Cached, Disk, Encrypted, Retrying, S3, Storage, Verify};
+pub use crate::storage::{
+    EncryptionMetadata, KeyFingerprint, KeyId, KeyManager, KeyRing,
+    KeyRingBuilder, KeyVersion, Keychain, ObjectHeader, VersionedKey,
+};
 
 #[cfg(feature = "faulty")]
 use crate::storage::Faulty;
@@ -82,7 +87,7 @@ impl Cache {
 #[derive(Debug)]
 pub struct S3ServerBuilder {
     bucket: String,
-    key: Option<[u8; 32]>,
+    keys: Option<KeyRing>,
     prefix: Option<String>,
     cdn: Option<String>,
     cache: Option<Cache>,
@@ -94,7 +99,7 @@ impl S3ServerBuilder {
             bucket,
             prefix: None,
             cdn: None,
-            key: None,
+            keys: None,
             cache: None,
         }
     }
@@ -105,10 +110,63 @@ impl S3ServerBuilder {
         self
     }
 
-    /// Sets the encryption key to use.
+    /// Sets the current encryption key.
+    ///
+    /// Calling this more than once rotates the current key and retains the
+    /// previous key for the default seven-day overlap window.
     pub fn key(&mut self, key: [u8; 32]) -> &mut Self {
-        self.key = Some(key);
+        self.keys = Some(match self.keys.take() {
+            Some(mut keys) => {
+                keys.rotate(key);
+                keys
+            }
+            None => KeyRing::new(key),
+        });
         self
+    }
+
+    /// Sets the complete key ring, including old keys accepted during rotation.
+    pub fn key_ring(&mut self, keys: KeyRing) -> &mut Self {
+        self.keys = Some(keys);
+        self
+    }
+
+    /// Adds a specific key version and makes it the current write key.
+    pub fn key_version(
+        &mut self,
+        version: KeyVersion,
+        key: [u8; 32],
+    ) -> &mut Self {
+        let mut keys = self
+            .keys
+            .take()
+            .unwrap_or_else(|| KeyRing::with_version(version, key));
+        if keys.get_version(version).is_none() {
+            keys.add(version, key);
+        }
+        keys.rotate_with_version(version, key);
+        self.keys = Some(keys);
+        self
+    }
+
+    /// Alias for [`S3ServerBuilder::key_ring`].
+    pub fn keys(&mut self, keys: KeyRing) -> &mut Self {
+        self.key_ring(keys)
+    }
+
+    /// Configures the previous key during the seven-day rotation window.
+    pub fn previous_key(&mut self, previous: [u8; 32]) -> &mut Self {
+        let keys = match self.keys.take() {
+            Some(keys) => keys.with_previous_key(previous),
+            None => KeyRing::with_version(1, previous),
+        };
+        self.keys = Some(keys);
+        self
+    }
+
+    /// Alias for [`S3ServerBuilder::previous_key`].
+    pub fn old_key(&mut self, previous: [u8; 32]) -> &mut Self {
+        self.previous_key(previous)
     }
 
     /// Sets the prefix to use.
@@ -175,9 +233,10 @@ impl S3ServerBuilder {
 
                 let cache = Cached::new(cache.max_size, disk, s3).await?;
 
-                match self.key {
-                    Some(key) => {
-                        let storage = Verify::new(Encrypted::new(key, cache));
+                match self.keys {
+                    Some(keys) => {
+                        let storage =
+                            Verify::new(Encrypted::with_key_ring(keys, cache));
                         Ok(Box::new(spawn_server(storage, &addr)))
                     }
                     None => {
@@ -186,9 +245,10 @@ impl S3ServerBuilder {
                     }
                 }
             }
-            None => match self.key {
-                Some(key) => {
-                    let storage = Verify::new(Encrypted::new(key, s3));
+            None => match self.keys {
+                Some(keys) => {
+                    let storage =
+                        Verify::new(Encrypted::with_key_ring(keys, s3));
                     Ok(Box::new(spawn_server(storage, &addr)))
                 }
                 None => {
@@ -217,7 +277,7 @@ impl S3ServerBuilder {
 #[derive(Debug)]
 pub struct LocalServerBuilder {
     path: PathBuf,
-    key: Option<[u8; 32]>,
+    keys: Option<KeyRing>,
     cache: Option<Cache>,
 }
 
@@ -227,15 +287,65 @@ impl LocalServerBuilder {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
-            key: None,
+            keys: None,
             cache: None,
         }
     }
 
-    /// Sets the encryption key to use.
+    /// Sets the current encryption key.
+    ///
+    /// Calling this more than once rotates the current key and retains the
+    /// previous key for the default seven-day overlap window.
     pub fn key(&mut self, key: [u8; 32]) -> &mut Self {
-        self.key = Some(key);
+        self.keys = Some(match self.keys.take() {
+            Some(mut keys) => {
+                keys.rotate(key);
+                keys
+            }
+            None => KeyRing::new(key),
+        });
         self
+    }
+
+    /// Sets the complete key ring, including old keys accepted during rotation.
+    pub fn key_ring(&mut self, keys: KeyRing) -> &mut Self {
+        self.keys = Some(keys);
+        self
+    }
+
+    /// Adds a specific key version and makes it the current write key.
+    pub fn key_version(
+        &mut self,
+        version: KeyVersion,
+        key: [u8; 32],
+    ) -> &mut Self {
+        let mut keys = self
+            .keys
+            .take()
+            .unwrap_or_else(|| KeyRing::with_version(version, key));
+        keys.rotate_with_version(version, key);
+        self.keys = Some(keys);
+        self
+    }
+
+    /// Alias for [`LocalServerBuilder::key_ring`].
+    pub fn keys(&mut self, keys: KeyRing) -> &mut Self {
+        self.key_ring(keys)
+    }
+
+    /// Configures the previous key during the seven-day rotation window.
+    pub fn previous_key(&mut self, previous: [u8; 32]) -> &mut Self {
+        let keys = match self.keys.take() {
+            Some(keys) => keys.with_previous_key(previous),
+            None => KeyRing::new(previous),
+        };
+        self.keys = Some(keys);
+        self
+    }
+
+    /// Alias for [`LocalServerBuilder::previous_key`].
+    pub fn old_key(&mut self, previous: [u8; 32]) -> &mut Self {
+        self.previous_key(previous)
     }
 
     /// Sets the cache to use. If not specified, then no local disk cache is
@@ -257,9 +367,10 @@ impl LocalServerBuilder {
     {
         let storage = Disk::new(self.path).map_err(Error::from).await?;
 
-        match self.key {
-            Some(key) => {
-                let storage = Verify::new(Encrypted::new(key, storage));
+        match self.keys {
+            Some(keys) => {
+                let storage =
+                    Verify::new(Encrypted::with_key_ring(keys, storage));
                 tracing::info!(
                     "Local disk storage initialized (with encryption)."
                 );

@@ -4,6 +4,7 @@ EXAMPLES
 
       # Change this to the output of `openssl rand -hex 32`.
       export RUDOLFS_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+      export RUDOLFS_PREVIOUS_KEY=yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
 
       rudolfs --host=localhost:8080 local --path=path/to/lfs/data
 

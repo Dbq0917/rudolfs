@@ -19,18 +19,27 @@
 // SOFTWARE.
 mod cached;
 mod disk;
-mod encrypt;
+pub mod encrypt;
 #[cfg(feature = "faulty")]
 mod faulty;
+pub mod keys;
 mod retrying;
 mod s3;
 mod verify;
 
 pub use cached::Backend as Cached;
 pub use disk::Backend as Disk;
-pub use encrypt::Backend as Encrypted;
+pub use encrypt::{
+    Backend as Encrypted, ENCRYPTION_HEADER_LEN, EncryptionHeaderError,
+    EncryptionMetadata, ObjectHeader, ObjectMetadata,
+};
 #[cfg(feature = "faulty")]
 pub use faulty::Backend as Faulty;
+pub use keys::{
+    DEFAULT_ROTATION_WINDOW, KeyFingerprint, KeyId, KeyManager, KeyRing,
+    KeyRingBuilder, KeyRingError, KeyVersion, Keychain, ROTATION_WINDOW,
+    VersionedKey,
+};
 pub use retrying::Backend as Retrying;
 pub use s3::Backend as S3;
 pub use verify::Backend as Verify;
@@ -141,6 +150,10 @@ impl LFSObject {
 
     pub fn len(&self) -> u64 {
         self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     pub fn stream(self) -> ByteStream {

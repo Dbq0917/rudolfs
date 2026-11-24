@@ -72,6 +72,22 @@ struct GlobalArgs {
     )]
     key: Option<[u8; 32]>,
 
+    /// Previous encryption key to accept during the seven-day rotation window.
+    #[structopt(
+        long = "previous-key",
+        parse(try_from_str = FromHex::from_hex),
+        env = "RUDOLFS_PREVIOUS_KEY"
+    )]
+    previous_key: Option<[u8; 32]>,
+
+    /// Alias for `--previous-key`.
+    #[structopt(
+        long = "old-key",
+        parse(try_from_str = FromHex::from_hex),
+        env = "RUDOLFS_OLD_KEY"
+    )]
+    old_key: Option<[u8; 32]>,
+
     /// Root directory of the object cache. If not specified or if the local
     /// disk is the storage backend, then no local disk cache will be used.
     #[structopt(long = "cache-dir", env = "RUDOLFS_CACHE_DIR")]
@@ -168,9 +184,11 @@ impl S3Args {
         let mut builder = S3ServerBuilder::new(self.bucket);
         builder.prefix(self.prefix);
 
-        if let Some(key) = global_args.key {
-            builder.key(key);
-        }
+        apply_key_ring(
+            &mut builder,
+            global_args.key,
+            global_args.previous_key.or(global_args.old_key),
+        );
 
         if let Some(cdn) = self.cdn {
             builder.cdn(cdn);
@@ -196,9 +214,11 @@ impl LocalArgs {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut builder = LocalServerBuilder::new(self.path);
 
-        if let Some(key) = global_args.key {
-            builder.key(key);
-        }
+        apply_key_ring(
+            &mut builder,
+            global_args.key,
+            global_args.previous_key.or(global_args.old_key),
+        );
 
         if let Some(cache_dir) = global_args.cache_dir {
             let max_cache_size = global_args
@@ -209,6 +229,46 @@ impl LocalArgs {
         }
 
         builder.run(addr).await
+    }
+}
+
+fn apply_key_ring<B>(
+    builder: &mut B,
+    current: Option<[u8; 32]>,
+    previous: Option<[u8; 32]>,
+) where
+    B: KeyRingConfig,
+{
+    if let Some(current) = current {
+        builder.key(current);
+    }
+    if let Some(previous) = previous {
+        builder.previous_key(previous);
+    }
+}
+
+trait KeyRingConfig {
+    fn key(&mut self, key: [u8; 32]) -> &mut Self;
+    fn previous_key(&mut self, key: [u8; 32]) -> &mut Self;
+}
+
+impl KeyRingConfig for rudolfs::S3ServerBuilder {
+    fn key(&mut self, key: [u8; 32]) -> &mut Self {
+        S3ServerBuilder::key(self, key)
+    }
+
+    fn previous_key(&mut self, key: [u8; 32]) -> &mut Self {
+        S3ServerBuilder::previous_key(self, key)
+    }
+}
+
+impl KeyRingConfig for rudolfs::LocalServerBuilder {
+    fn key(&mut self, key: [u8; 32]) -> &mut Self {
+        LocalServerBuilder::key(self, key)
+    }
+
+    fn previous_key(&mut self, key: [u8; 32]) -> &mut Self {
+        LocalServerBuilder::previous_key(self, key)
     }
 }
 

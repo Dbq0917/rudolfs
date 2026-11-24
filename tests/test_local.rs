@@ -66,6 +66,65 @@ async fn local_smoke_test_encrypted() -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn local_encrypted_key_rotation_reads_old_object()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = init_logger();
+
+    let mut rng = StdRng::seed_from_u64(7);
+    let data = tempfile::TempDir::new()?;
+    let old_key = rng.random();
+    let new_key = rng.random();
+
+    let mut first_server = LocalServerBuilder::new(data.path().into());
+    first_server.key(old_key);
+    let first_server = first_server.spawn(SERVER_ADDR).await?;
+    let first_addr = first_server.addr();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let first_join =
+        tokio::spawn(futures::future::select(shutdown_rx, first_server));
+
+    let repo = GitRepo::init(first_addr)?;
+    repo.add_random(Path::new("rotate.bin"), 1024 * 1024, &mut rng)?;
+    repo.commit("Add object before key rotation")?;
+    repo.lfs_push()?;
+
+    shutdown_tx.send(()).expect("first server died too soon");
+    let _ = first_join.await?;
+
+    let mut rotated_server = LocalServerBuilder::new(data.path().into());
+    rotated_server.key(new_key).previous_key(old_key);
+    let rotated_server = rotated_server.spawn(SERVER_ADDR).await?;
+    let rotated_addr = rotated_server.addr();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let rotated_join =
+        tokio::spawn(futures::future::select(shutdown_rx, rotated_server));
+
+    repo.set_lfs_endpoint(rotated_addr)?;
+    repo.clean_lfs()?;
+
+    // The one-week rotation overlap is represented by configuring both keys.
+    // The object header selects `old_key` by its version and fingerprint.
+    repo.lfs_pull()?;
+
+    repo.add_random(Path::new("after-rotation.bin"), 512 * 1024, &mut rng)?;
+    repo.commit("Add object after key rotation")?;
+    repo.lfs_push()?;
+
+    // Force both the old-key and new-key objects to be downloaded again.
+    repo.clean_lfs()?;
+    repo.lfs_pull()?;
+
+    shutdown_tx.send(()).expect("rotated server died too soon");
+    if let Either::Right((result, _)) = rotated_join.await? {
+        result?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn local_smoke_test_unencrypted() -> Result<(), Box<dyn std::error::Error>>
 {
     let _guard = init_logger();

@@ -125,6 +125,19 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Points this repository at another test server address.
+    pub fn set_lfs_endpoint(&self, addr: SocketAddr) -> io::Result<()> {
+        cmd!(
+            "git",
+            "config",
+            "lfs.url",
+            format!("http://{}/api/test/test", addr)
+        )
+        .dir(self.repo.path())
+        .run()?;
+        Ok(())
+    }
+
     pub fn pull(&self) -> io::Result<()> {
         cmd!("git", "pull").dir(self.repo.path()).run()?;
         Ok(())
