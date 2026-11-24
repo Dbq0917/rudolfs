@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+ - Distribute local disk objects across 16 buckets using the size actually
+   written to disk. Bucket usage is tracked incrementally so uploads don't
+   rescan the storage tree.
  - Replaced the unmaintained Rusoto crate with Amazon's official AWS SDK for
    Rust (`aws-sdk-s3`). (#66)
    - Kubernetes IRSA (web identity) credentials are now supported via the

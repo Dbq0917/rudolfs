@@ -19,9 +19,10 @@
 // SOFTWARE.
 mod common;
 
+use std::fs;
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use futures::future::Either;
 use rand::Rng;
@@ -31,6 +32,98 @@ use rudolfs::LocalServerBuilder;
 use tokio::sync::oneshot;
 
 use common::{GitRepo, SERVER_ADDR, init_logger};
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_encrypted_writes_are_balanced_across_buckets()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = init_logger();
+
+    let mut rng = StdRng::seed_from_u64(42);
+
+    let data = tempfile::TempDir::new()?;
+    let key = rng.random();
+
+    let mut server = LocalServerBuilder::new(data.path().into());
+    server.key(key);
+    let server = server.spawn(SERVER_ADDR).await?;
+    let addr = server.addr();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(futures::future::select(shutdown_rx, server));
+
+    const OBJECT_SIZE: usize = 8192;
+    const OBJECT_COUNT: usize = 32;
+
+    let repo = GitRepo::init(addr)?;
+    for i in 0..OBJECT_COUNT {
+        repo.add_random(
+            &PathBuf::from(format!("{i}.bin")),
+            OBJECT_SIZE,
+            &mut rng,
+        )?;
+    }
+    repo.commit("Add many equally-sized LFS objects")?;
+    repo.lfs_push()?;
+
+    shutdown_tx.send(()).expect("server died too soon");
+
+    if let Either::Right((result, _)) = server.await? {
+        result?;
+    }
+
+    let sizes = bucket_sizes(&data.path().join("objects/test/test"))?;
+
+    assert_eq!(sizes.len(), 16, "all buckets should be used: {sizes:?}");
+
+    let min = *sizes.first().unwrap();
+    let max = *sizes.last().unwrap();
+
+    assert!(
+        max - min <= OBJECT_SIZE as u64,
+        "bucket sizes are imbalanced: {sizes:?}"
+    );
+
+    Ok(())
+}
+
+fn bucket_sizes(namespace: &Path) -> io::Result<Vec<u64>> {
+    let mut sizes = Vec::new();
+
+    for entry in fs::read_dir(namespace)? {
+        let entry = entry?;
+
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        if name.len() == 1 && u8::from_str_radix(&name, 16).is_ok() {
+            sizes.push(dir_size(&entry.path())?);
+        }
+    }
+
+    sizes.sort_unstable();
+    Ok(sizes)
+}
+
+fn dir_size(path: &Path) -> io::Result<u64> {
+    let mut size = 0;
+
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+
+        if file_type.is_dir() {
+            size += dir_size(&entry.path())?;
+        } else if file_type.is_file() {
+            size += entry.metadata()?.len();
+        }
+    }
+
+    Ok(size)
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn local_smoke_test_encrypted() -> Result<(), Box<dyn std::error::Error>>
