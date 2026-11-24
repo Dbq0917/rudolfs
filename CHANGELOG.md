@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Fixed the local disk cache deleting an object's file while a client was
+  still reading it. Reads now hold a reference on the cached entry for the
+  entire lifetime of their byte stream. Cache eviction skips referenced
+  entries (and continues evicting other entries), while explicit deletions of
+  a busy entry remove it from the LRU immediately and defer the underlying
+  file removal until the last reader finishes. This prevents large uploads
+  and downloads from being interrupted mid-transfer by cache pruning.
  - Replaced the unmaintained Rusoto crate with Amazon's official AWS SDK for
    Rust (`aws-sdk-s3`). (#66)
    - Kubernetes IRSA (web identity) credentials are now supported via the

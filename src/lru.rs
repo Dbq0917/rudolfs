@@ -74,18 +74,6 @@ where
         Ok(cache)
     }
 
-    /// Removes the least recently used item. Returns `None` if the cache is
-    /// empty. When the cache gets too large, this should be called in a loop in
-    /// order to bring it below the threshold.
-    pub fn pop(&mut self) -> Option<(K, u64)> {
-        if let Some((k, v)) = self.map.pop_front() {
-            self.size -= v;
-            Some((k, v))
-        } else {
-            None
-        }
-    }
-
     /// Removes an entry from the cache. Returns the size of the object if it
     /// exists, or `None` if it didn't exist in the cache.
     pub fn remove(&mut self, key: &K) -> Option<u64> {
@@ -118,5 +106,71 @@ where
         } else {
             None
         }
+    }
+
+    /// Removes and returns the least recently used entry for which `evict`
+    /// returns `true`. Entries for which `evict` returns `false` are skipped
+    /// over and left untouched in their original position. Returns `None` if
+    /// there is no evictable entry.
+    ///
+    /// This allows pruning to skip over entries that are currently being read
+    /// without disturbing the LRU ordering.
+    pub fn pop_if<F>(&mut self, mut evict: F) -> Option<(K, u64)>
+    where
+        F: FnMut(&K) -> bool,
+        K: Clone,
+    {
+        let key = self.map.keys().find(|k| evict(k))?.clone();
+        let size = self.map.remove(&key)?;
+        self.size -= size;
+        Some((key, size))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cache;
+
+    #[test]
+    fn pop_if_skips_protected_entries() {
+        let mut cache: Cache<u32> = Cache::new();
+
+        cache.push(1, 10);
+        cache.push(2, 20);
+        cache.push(3, 30);
+        assert_eq!(cache.size(), 60);
+
+        // The least recently used entry (1) is protected, so pruning must skip
+        // over it and remove the next evictable entry (2).
+        let popped = cache.pop_if(|key| *key != 1);
+        assert_eq!(popped, Some((2, 20)));
+        assert_eq!(cache.size(), 40);
+        assert!(cache.get(&1).is_some());
+        assert!(cache.get(&2).is_none());
+        assert!(cache.get(&3).is_some());
+
+        // Ordering is untouched: 1 is still the least recently used.
+        let popped = cache.pop_if(|_| true);
+        assert_eq!(popped, Some((1, 10)));
+        assert_eq!(cache.size(), 30);
+
+        let popped = cache.pop_if(|_| true);
+        assert_eq!(popped, Some((3, 30)));
+        assert_eq!(cache.size(), 0);
+
+        // Nothing left to evict.
+        assert_eq!(cache.pop_if(|_| true), None);
+    }
+
+    #[test]
+    fn pop_if_returns_none_when_all_protected() {
+        let mut cache: Cache<u32> = Cache::new();
+        cache.push(1, 10);
+        cache.push(2, 20);
+
+        assert_eq!(cache.pop_if(|_| false), None);
+        // Nothing was removed, so the size is unchanged.
+        assert_eq!(cache.size(), 30);
+        assert_eq!(cache.len(), 2);
     }
 }

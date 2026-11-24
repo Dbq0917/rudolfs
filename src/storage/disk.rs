@@ -57,6 +57,13 @@ impl Backend {
             key.oid().path()
         ))
     }
+
+    /// Returns the on-disk path of a cached object. Used by tests to verify
+    /// that a file is not deleted while it is being read.
+    #[cfg(test)]
+    pub(crate) fn object_path(&self, key: &StorageKey) -> PathBuf {
+        self.key_to_path(key)
+    }
 }
 
 #[async_trait]
