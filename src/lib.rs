@@ -27,6 +27,7 @@ mod logger;
 mod lru;
 mod sha256;
 mod storage;
+mod upload;
 mod util;
 
 use std::convert::Infallible;
@@ -297,10 +298,11 @@ where
     Error: From<S::Error>,
 {
     let storage = Arc::new(storage);
+    let uploads = Arc::new(crate::upload::Uploads::new());
 
     let new_service = make_service_fn(move |socket: &AddrStream| {
         // Create our app.
-        let service = App::new(storage.clone());
+        let service = App::with_uploads(storage.clone(), uploads.clone());
 
         // Add logging middleware
         future::ok::<_, Infallible>(Logger::new(socket.remote_addr(), service))

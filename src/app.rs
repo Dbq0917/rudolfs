@@ -20,6 +20,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
+use std::sync::Arc;
 
 use core::task::{Context, Poll};
 
@@ -28,6 +29,8 @@ use futures::{
     future::{self, BoxFuture},
     stream::TryStreamExt,
 };
+use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
 
 use hyper::{
     self, HeaderMap, Method, Request, Response, StatusCode, Uri, body::Body,
@@ -38,7 +41,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::Error;
 use crate::hyperext::RequestExt;
 use crate::lfs;
-use crate::storage::{LFSObject, Namespace, Storage, StorageKey};
+use crate::storage::{ByteStream, LFSObject, Namespace, Storage, StorageKey};
+use crate::upload::{ChunkSpec, Uploads};
 use std::time::Duration;
 
 const UPLOAD_EXPIRATION: Duration = Duration::from_secs(30 * 60);
@@ -74,11 +78,20 @@ struct IndexTemplate<'a> {
 #[derive(Clone)]
 pub struct App<S> {
     storage: S,
+    uploads: Arc<Uploads>,
 }
 
 impl<S> App<S> {
+    #[allow(dead_code)]
     pub fn new(storage: S) -> Self {
-        App { storage }
+        App {
+            storage,
+            uploads: Arc::new(Uploads::new()),
+        }
+    }
+
+    pub fn with_uploads(storage: S, uploads: Arc<Uploads>) -> Self {
+        App { storage, uploads }
     }
 }
 
@@ -111,6 +124,7 @@ where
     /// Handles `/api` routes.
     async fn api(
         storage: S,
+        uploads: Arc<Uploads>,
         req: Request<Body>,
     ) -> Result<Response<Body>, Error> {
         let mut parts = req.uri().path().split('/').filter(|s| !s.is_empty());
@@ -147,7 +161,12 @@ where
 
                 match *req.method() {
                     Method::GET => Self::download(storage, req, key).await,
-                    Method::PUT => Self::upload(storage, req, key).await,
+                    Method::HEAD => {
+                        Self::upload_status(storage, uploads, key).await
+                    }
+                    Method::PUT | Method::PATCH => {
+                        Self::upload(storage, uploads, req, key).await
+                    }
                     _ => Self::not_found(req),
                 }
             }
@@ -186,6 +205,26 @@ where
     /// Uploads a single LFS object.
     async fn upload(
         storage: S,
+        uploads: Arc<Uploads>,
+        req: Request<Body>,
+        key: StorageKey,
+    ) -> Result<Response<Body>, Error> {
+        let spec = match ChunkSpec::parse(req.uri(), req.headers()) {
+            Ok(Some(spec)) => spec,
+            Ok(None) => return Self::upload_whole(storage, req, key).await,
+            Err(err) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::from(err))?);
+            }
+        };
+
+        Self::upload_chunk(storage, uploads, req, key, spec).await
+    }
+
+    /// Uploads a complete LFS object in a single request.
+    async fn upload_whole(
+        storage: S,
         req: Request<Body>,
         key: StorageKey,
     ) -> Result<Response<Body>, Error> {
@@ -214,6 +253,187 @@ where
 
         Ok(Response::builder()
             .status(StatusCode::OK)
+            .body(Body::empty())?)
+    }
+
+    /// Receives one chunk of a resumable upload and commits it if its offset
+    /// still matches the server's committed offset.
+    async fn upload_chunk(
+        storage: S,
+        uploads: Arc<Uploads>,
+        req: Request<Body>,
+        key: StorageKey,
+        spec: ChunkSpec,
+    ) -> Result<Response<Body>, Error> {
+        let (chunk_path, mut chunk_file) = uploads.create_chunk().await?;
+        let mut received = 0u64;
+        let mut body = req.into_body().map_err(io::Error::other);
+
+        loop {
+            let bytes = match body.try_next().await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => break,
+                Err(err) => {
+                    drop(chunk_file);
+                    uploads.remove_chunk(&chunk_path).await;
+                    return Err(err.into());
+                }
+            };
+
+            if let Err(err) = chunk_file.write_all(&bytes).await {
+                drop(chunk_file);
+                uploads.remove_chunk(&chunk_path).await;
+                return Err(err.into());
+            }
+
+            received += bytes.len() as u64;
+        }
+
+        if let Err(err) = chunk_file.flush().await {
+            drop(chunk_file);
+            uploads.remove_chunk(&chunk_path).await;
+            return Err(err.into());
+        }
+
+        drop(chunk_file);
+
+        if let Some(expected) = spec.len()
+            && received != expected
+        {
+            uploads.remove_chunk(&chunk_path).await;
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!(
+                    "invalid chunk length: expected {expected}, got {received}"
+                )))?);
+        }
+
+        let lock = uploads.lock(&key);
+        let _guard = lock.lock().await;
+
+        let has_partial = uploads.has_partial(&key).await?;
+        let stored_size = if has_partial {
+            None
+        } else {
+            storage.size(&key).await?
+        };
+
+        let current = uploads.current_offset(&key, stored_size).await?;
+
+        if spec.offset != current {
+            uploads.remove_chunk(&chunk_path).await;
+            return offset_conflict(spec.offset, current);
+        }
+
+        let new_offset = match current.checked_add(received) {
+            Some(offset) => offset,
+            None => {
+                uploads.remove_chunk(&chunk_path).await;
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::from("upload length overflow"))?);
+            }
+        };
+
+        if let Some(total) = spec.total
+            && new_offset > total
+        {
+            uploads.remove_chunk(&chunk_path).await;
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!(
+                    "chunk exceeds object size: offset={new_offset}, \
+                     size={total}"
+                )))?);
+        }
+
+        let new_offset = match uploads.append(&key, current, &chunk_path).await
+        {
+            Ok(offset) => offset,
+            Err(err) => {
+                uploads.remove_chunk(&chunk_path).await;
+                return Err(err.into());
+            }
+        };
+
+        uploads.remove_chunk(&chunk_path).await;
+
+        let complete = spec.complete
+            || spec.total.is_some_and(|total| new_offset == total);
+
+        if complete {
+            let total = spec.total.unwrap_or(new_offset);
+
+            if new_offset != total {
+                let _ = uploads.truncate(&key, current).await;
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::from(format!(
+                        "incomplete object: got {new_offset} of {total} bytes"
+                    )))?);
+            }
+
+            let Some(file) = uploads.open_partial(&key).await? else {
+                return Err(io::Error::other("missing partial upload").into());
+            };
+
+            let stream: ByteStream = Box::pin(ReaderStream::new(file));
+
+            if let Err(err) = storage
+                .put(key.clone(), LFSObject::new(total, stream))
+                .await
+            {
+                let _ = uploads.truncate(&key, current).await;
+                return Err(err.into());
+            }
+
+            let _ = uploads.remove_partial(&key).await;
+        }
+
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header("Upload-Offset", new_offset);
+
+        if let Some(total) = spec.total {
+            response = response.header("Upload-Length", total);
+        }
+
+        if !complete && new_offset > 0 {
+            response =
+                response.header("Range", format!("bytes=0-{}", new_offset - 1));
+        }
+
+        Ok(response.body(Body::empty())?)
+    }
+
+    /// Reports the committed offset of an in-progress or completed upload.
+    async fn upload_status(
+        storage: S,
+        uploads: Arc<Uploads>,
+        key: StorageKey,
+    ) -> Result<Response<Body>, Error> {
+        let lock = uploads.lock(&key);
+        let _guard = lock.lock().await;
+
+        let has_partial = uploads.has_partial(&key).await?;
+        let stored_size = if has_partial {
+            None
+        } else {
+            storage.size(&key).await?
+        };
+
+        if !has_partial && stored_size.is_none() {
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())?);
+        }
+
+        let offset = uploads.current_offset(&key, stored_size).await?;
+
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Upload-Offset", offset)
+            .header(header::CONTENT_LENGTH, 0)
             .body(Body::empty())?)
     }
 
@@ -498,9 +718,226 @@ where
         if req.uri().path() == "/" {
             Box::pin(future::ready(Self::index(req)))
         } else if req.uri().path().starts_with("/api/") {
-            Box::pin(Self::api(self.storage.clone(), req))
+            Box::pin(Self::api(self.storage.clone(), self.uploads.clone(), req))
         } else {
             Box::pin(future::ready(Self::not_found(req)))
         }
+    }
+}
+
+fn offset_conflict(
+    expected: u64,
+    current: u64,
+) -> Result<Response<Body>, Error> {
+    let mut response = Response::builder()
+        .status(StatusCode::CONFLICT)
+        .header("Upload-Offset", current);
+
+    if current > 0 {
+        response = response.header("Range", format!("bytes=0-{}", current - 1));
+    }
+
+    Ok(response.body(Body::from(format!(
+        "stale upload offset: expected {expected}, server has {current}"
+    )))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::Disk;
+    use bytes::Bytes;
+    use futures::stream;
+    use hyper::body::to_bytes;
+    use sha2::{Digest, Sha256};
+    use tempfile::TempDir;
+
+    fn chunk_request(
+        uri: &str,
+        data: &[u8],
+        start: u64,
+        end: u64,
+        total: u64,
+    ) -> Request<Body> {
+        Request::builder()
+            .method(Method::PUT)
+            .uri(uri)
+            .header(header::CONTENT_LENGTH, data.len())
+            .header("Content-Range", format!("bytes {start}-{end}/{total}"))
+            .body(Body::from(data.to_vec()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn concurrent_resume_at_same_offset_is_rejected() {
+        const CHUNK: usize = 16 * 1024;
+        const TOTAL: usize = CHUNK * 4;
+
+        let mut data = vec![0u8; TOTAL];
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = (i % 251) as u8;
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(&data);
+        let oid = crate::lfs::Oid::from(<[u8; 32]>::from(hasher.finalize()));
+        let dir = TempDir::new().unwrap();
+        let disk = Arc::new(Disk::new(dir.path().to_path_buf()).await.unwrap());
+        let uploads = Arc::new(Uploads::new());
+        let app = App::with_uploads(disk, uploads);
+        let uri = format!("/api/test/test/object/{oid}");
+
+        let mut first = app.clone();
+        let response = first
+            .call(chunk_request(
+                &uri,
+                &data[..CHUNK],
+                0,
+                CHUNK as u64 - 1,
+                TOTAL as u64,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut client_a = app.clone();
+        let mut client_b = app.clone();
+        let request_a = chunk_request(
+            &uri,
+            &data[CHUNK..CHUNK * 2],
+            CHUNK as u64,
+            (CHUNK * 2) as u64 - 1,
+            TOTAL as u64,
+        );
+        let request_b = chunk_request(
+            &uri,
+            &data[CHUNK..CHUNK * 2],
+            CHUNK as u64,
+            (CHUNK * 2) as u64 - 1,
+            TOTAL as u64,
+        );
+
+        let (response_a, response_b) = tokio::join!(
+            async move { client_a.call(request_a).await.unwrap() },
+            async move { client_b.call(request_b).await.unwrap() },
+        );
+
+        let mut statuses = [response_a.status(), response_b.status()];
+        statuses.sort();
+
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::CONFLICT]);
+
+        let mut client = app.clone();
+        let response = client
+            .call(chunk_request(
+                &uri,
+                &data[CHUNK * 2..],
+                (CHUNK * 2) as u64,
+                TOTAL as u64 - 1,
+                TOTAL as u64,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(body.as_ref(), data.as_slice());
+    }
+
+    #[tokio::test]
+    async fn interrupted_chunk_does_not_advance_offset() {
+        const CHUNK: usize = 16 * 1024;
+
+        let mut data = vec![0u8; CHUNK * 2];
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = (i % 239) as u8;
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(&data);
+        let oid = crate::lfs::Oid::from(<[u8; 32]>::from(hasher.finalize()));
+
+        let dir = TempDir::new().unwrap();
+        let disk = Arc::new(Disk::new(dir.path().to_path_buf()).await.unwrap());
+        let app = App::with_uploads(disk, Arc::new(Uploads::new()));
+        let uri = format!("/api/test/test/object/{oid}");
+
+        let mut client = app.clone();
+        let response = client
+            .call(chunk_request(
+                &uri,
+                &data[..CHUNK],
+                0,
+                CHUNK as u64 - 1,
+                (CHUNK * 2) as u64,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let partial = data[CHUNK..CHUNK + 1024].to_vec();
+        let body = Body::wrap_stream(stream::iter(vec![
+            Ok::<_, io::Error>(Bytes::from(partial)),
+            Err(io::Error::other("client disconnected")),
+        ]));
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri(&uri)
+            .header(
+                "Content-Range",
+                format!("bytes {}-{}/{}", CHUNK, CHUNK * 2 - 1, CHUNK * 2),
+            )
+            .body(body)
+            .unwrap();
+
+        let mut client = app.clone();
+        assert!(client.call(request).await.is_err());
+
+        let request = Request::builder()
+            .method(Method::HEAD)
+            .uri(&uri)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("Upload-Offset")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            CHUNK.to_string()
+        );
+
+        let mut client = app.clone();
+        let response = client
+            .call(chunk_request(
+                &uri,
+                &data[CHUNK..],
+                CHUNK as u64,
+                (CHUNK * 2) as u64 - 1,
+                (CHUNK * 2) as u64,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().call(request).await.unwrap();
+        let body = to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(body.as_ref(), data.as_slice());
     }
 }
